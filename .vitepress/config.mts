@@ -71,7 +71,7 @@ export default defineConfig({
 
   themeConfig: {
     // https://vitepress.dev/reference/default-theme-config
-    logo: { light: "/logo.svg", dark: "/logo-dark.svg" },
+    logo: { light: "/logo.png", dark: "/logo.png" },
 
     nav: [
       { text: "Home", link: "/" },

@@ -7,7 +7,7 @@ hero:
   text: "A programming language for embedded scripting"
   tagline: Static, Small, Safe, Simple — no GC, no hidden state, no surprises
   image:
-    ./logo.png
+    /logo.png
   actions:
     - theme: brand
       text: Language Intro
