@@ -1,0 +1,12 @@
+title: Zoltra Project
+tagline: >-
+  Stilla — a small, statically typed language for deterministic embedded
+  scripting, host integration, and machine-generated code.
+description: >-
+  The Zoltra Project's Stilla: a small, statically typed language for
+  deterministic embedded scripting, host integration, and machine-generated
+  code, implemented in Zig. Specification: v1.3 Draft.
+show_downloads: false
+theme: jekyll-theme-midnight
+github:
+  repository_url: https://github.com/zoltrazig/stilla
