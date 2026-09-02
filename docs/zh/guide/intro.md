@@ -82,6 +82,7 @@ let y = identity(7);             // T 由实参推断
 核心语言没有循环结构。重复靠递归，`iter` 模块提供 `fold` / `each` 组合子。优化器会把尾递归改写成真正的循环：源码里没有循环，机器码里有。
 
 ```stilla
+const builtin = import("builtin");
 const lists = import("list");
 const iter = import("iter");
 
@@ -89,18 +90,38 @@ fn go(n: int32, acc: int32) -> int32 {        // 尾调用
     if (n == 0) { acc } else { go(n - 1, acc + n) }
 }
 
-const total = iter.fold[int32, int32](lists.range(1, 10), 0,
-    fn(move acc: int32, borrow x: int32) -> int32 { acc + x });
+fn main() -> void {
+    builtin.assert(go(10, 0) == 55, "递归求和 0 + 1 + … + 10");
+    let total = iter.fold[int32, int32](lists.range(0, 10), 0,
+        fn(move acc: int32, borrow x: int32) -> int32 { acc + x });
+    builtin.assert(total == 55, "fold 求和 0 + 1 + … + 10");
+}
 ```
 
-两者都算出 1 + … + 10；优化器会把 `go` 改写成真正的循环。
+两者遍历的是同一个边界 `[0, 10]`：`go(10, 0)` 把 `n` 从 10 一路数到 0；`list.range` 是闭区间，所以 `range(0, 10)` 覆盖同样的十一个元素。两者都得到 55——而优化器会把 `go` 改写成真正的循环。
 
 ### 无 GC——显式所有权
 
 值分为两类：
 
-- **copy（可复制）**——可隐式复制，销毁是无操作：数值标量（`byte`、`int32`、`uint32`、`i64`、`u64`、`float32`、`f64`）、`bool`、`str`、函数值。
+- **copy（可复制）**——可隐式复制，销毁是无操作：数值标量（`byte`、`int32`、`uint32`、`int64`、`uint64`、`float32`、`float64`）、`bool`、`str`、函数值。
 - **unique（唯一）**——不能被隐式复制；最多移动一次，恰好销毁一次，可被多次借用。任何带 `drop` 钩子、或包含 unique 组件的结构体都是 unique。
+
+一个结构体最多声明一个销毁钩子——而声明钩子正是让结构体成为 unique 的原因：
+
+```stilla
+struct Token {
+    id: int32;
+
+    drop(token) {                      // 值消亡时恰好执行一次
+        builtin.print("drop token " + builtin.str(token.id));
+    }
+}
+```
+
+无论值在哪里消亡——作用域结束、显式 `drop`、或是被 `move` 进被调函数——钩子都恰好执行一次。借用永远不会触发它。
+
+在正常控制流下，销毁顺序是完全确定的：先执行用户 `drop` 钩子，再按声明顺序的逆序销毁 unique 字段，最后将值标记为已销毁。局部变量在作用域结束时按创建顺序的逆序销毁。结构体*不是*类：没有构造函数、没有可见性控制。
 
 三个显式操作，全部静态检查：
 
@@ -112,47 +133,47 @@ fn show(borrow t: Token) -> int32 {   // borrow（借用）：只读视图，所
 fn consume(move t: Token) -> void {   // move（移动）：所有权进入函数
     drop t;                           // 显式销毁
 }
-```
 
-使用已移动的值是编译错误。只在部分分支上被释放的绑定会变成 **maybe-unique**：编译器会在每个没有释放它的分支上补上析构，汇合之后它统一处于已释放状态——不需要任何运行时记录。回报是：没有 GC 停顿、没有后台回收器、释放时机在编译期即可预测。
-
-### 确定性销毁
-
-一个结构体最多声明一个销毁钩子：
-
-```stilla
-struct File {
-    fd: int32;
-    path: str;
-
-    drop(file) {
-        os.close(file.fd);
-    }
+fn main() -> void {
+    let a = Token { id: 1 };
+    builtin.print(builtin.str(show(a)));   // borrow：a 仍然存活
+    consume(move a);                       // move：所有权离开
+    let b = Token { id: 2 };
+    drop b;                                // drop：显式销毁
+    let c = Token { id: 3 };               // 没有显式 drop：作用域结束时销毁
 }
 ```
 
-在正常控制流下，销毁顺序是完全确定的：先执行用户 `drop` 钩子，再按声明顺序的逆序销毁 unique 字段，最后将值标记为已销毁。局部变量在作用域结束时按创建顺序的逆序销毁。结构体*不是*类：没有构造函数、没有可见性控制。
+使用已移动的值是编译错误。只在部分分支上被释放的绑定会变成 **maybe-unique**：编译器会在每个没有释放它的分支上补上析构，汇合之后它统一处于已释放状态——不需要任何运行时记录。回报是：没有 GC 停顿、没有后台回收器、释放时机在编译期即可预测。
 
 ### 没有闭包——两种补偿
 
 函数和 lambda 不能捕获周围的局部绑定。作为交换，函数值只是简单的单态化代码引用：没有堆分配的闭包环境、没有面向代码生成器的捕获分析。有两种补偿方式：
 
 1. **函数值字段**——结构体可以存函数值，配合显式接收者（没有 `receiver.method()` 这种语法糖）。
-2. **上下文穿线（context threading）**——`iter` 模块的 `*_with` 组合子接受一个被借用的上下文，在每次调用时传给操作：
+2. **上下文穿线（context threading）**——`iter` 模块的 `*_with` 组合子接受一个被借用的上下文，在每次调用时传给操作——这里是一个结构体值，正是闭包原本会捕获的东西：
 
 ```stilla
-let sum = iter.fold[int32, int32](lists.range(1, 10), 0,
-    fn(move acc: int32, borrow x: int32) -> int32 { acc + x });
+struct Scale {
+    factor: int32;
+}
+
+let scale = Scale { factor: 3 };
+
+let sum = iter.fold_with[int32, int32, Scale](lists.range(1, 10), 0, scale,
+    fn(move acc: int32, borrow ctx: Scale, borrow x: int32) -> int32 {
+        acc + x * ctx.factor
+    });
 ```
+
+`fold_with` 在每次调用时都把被借用的 `Scale` 值穿线传给 step；lambda 从不接触自身参数以外的任何东西。
 
 ### 单一求值规则，确定的失败行为
 
-整个语言只有一条求值顺序规则：子表达式按源码顺序从左到右、恰好求值一次——调用、成员与下标访问、二元操作数、字面量、`match` 的被匹配对象都适用。`and` / `or` 会短路。运行时的失败分为两类：
+整个语言只有一条求值顺序规则：子表达式按源码顺序从左到右、恰好求值一次；`and` / `or` 会短路。运行时的失败分为两类：
 
-- **数值行为是规定好的，而不是陷阱。** 整数运算按 2³² / 2⁶⁴ 取模回绕——溢出永不陷阱。整数 `div` / `rem` 除以零会陷阱（`int32_min div -1` 回绕；`i64_min div -1` 陷阱）。浮点除法与取余除以零遵循 IEEE 754（`±inf`、NaN），永不陷阱。移位把计数按 32 / 64 取模。数值 `as` 转换永不陷阱：浮点转整数截断并向目标范围饱和（NaN 变为 0）。
-- **确定性的陷阱。** 非法的 `any` 恢复、非法的列表元素读取（对短列表的消耗式解构）、越界的 `array.get` / `array.set`、非法的 `string` 操作（越界偏移、非法 UTF-8）都会陷阱——绝不是未定义行为——终止方式与 `builtin.panic` 完全相同。
-
-浮点遵循 IEEE 754（`float32` = binary32，`f64` = binary64）；NaN 载荷无损往返。
+- **数值行为是规定好的，而不是陷阱。** 整数运算按 2³² / 2⁶⁴ 取模回绕——溢出永不陷阱；`div` / `rem` 除以零会陷阱（`int32_min div -1` 回绕，`int64_min div -1` 陷阱）。浮点遵循 IEEE 754——除以零得到 `±inf` / NaN，永不陷阱，NaN 载荷无损往返（类型名是 `float32` 和 `float64`）。移位把计数按 32 / 64 取模。数值 `as` 转换永不陷阱：浮点转整数截断并向目标范围饱和（NaN 变为 0）。
+- **确定性的陷阱。** 非法的 `any` 恢复、对短列表的消耗式解构、越界的 `array.get` / `array.set`、非法的 `string` 操作（越界偏移、非法 UTF-8）都会陷阱——绝不是未定义行为——终止方式与 `builtin.panic` 完全相同。
 
 ### 恐慌（panic）：终止，而不解栈
 

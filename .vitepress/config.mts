@@ -93,4 +93,7 @@ export default defineConfig({
       { icon: "github", link: "https://github.com/zoltrazig/stilla" },
     ],
   },
+  sitemap: {
+    hostname: 'https://example.com'
+  },
 });

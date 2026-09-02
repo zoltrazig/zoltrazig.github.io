@@ -105,6 +105,7 @@ tail recursion back into real loops: no loops in the source, loops in the
 machine code.
 
 ```stilla
+const builtin = import("builtin");
 const lists = import("list");
 const iter = import("iter");
 
@@ -112,22 +113,53 @@ fn go(n: int32, acc: int32) -> int32 {        // tail call
     if (n == 0) { acc } else { go(n - 1, acc + n) }
 }
 
-const total = iter.fold[int32, int32](lists.range(1, 10), 0,
-    fn(move acc: int32, borrow x: int32) -> int32 { acc + x });
+fn main() -> void {
+    builtin.assert(go(10, 0) == 55, "recursion sums 0 + 1 + … + 10");
+    let total = iter.fold[int32, int32](lists.range(0, 10), 0,
+        fn(move acc: int32, borrow x: int32) -> int32 { acc + x });
+    builtin.assert(total == 55, "fold sums 0 + 1 + … + 10");
+}
 ```
 
-Both compute 1 + … + 10; the optimizer rewrites `go` into a real loop.
+Both walk the same boundary `[0, 10]`: `go(10, 0)` counts `n` down from
+10 to 0, and `list.range` is inclusive, so `range(0, 10)` covers the same
+eleven elements. Both sum to 55 — and the optimizer rewrites `go` into a
+real loop.
 
 ### No GC — explicit ownership
 
 Values come in two classes:
 
 - **copy** — implicitly copyable, destruction is a no-op: the numeric
-  scalars (`byte`, `int32`, `uint32`, `i64`, `u64`, `float32`, `f64`),
+  scalars (`byte`, `int32`, `uint32`, `int64`, `uint64`, `float32`,
+  `float64`),
   `bool`, `str`, and function values.
 - **unique** — cannot be implicitly copied; moved at most once, destroyed
   exactly once, borrowable many times. Any struct with a `drop` hook or a
   unique component is unique.
+
+A struct may declare at most one destruction hook — and declaring one is
+exactly what makes the struct unique:
+
+```stilla
+struct Token {
+    id: int32;
+
+    drop(token) {                      // runs exactly once, when the value dies
+        builtin.print("drop token " + builtin.str(token.id));
+    }
+}
+```
+
+The hook fires exactly once, wherever the value dies — at scope end, at
+an explicit `drop`, or inside a callee the value was `move`d into.
+Borrowing never runs it.
+
+On normal control flow, destruction order is fully deterministic: the
+user `drop` hook first, then unique fields in reverse declaration order,
+then the value is marked destroyed. Locals are destroyed in reverse
+creation order at scope end. Structs are *not* classes: no constructors,
+no visibility control.
 
 Three explicit operations, all checked statically:
 
@@ -139,6 +171,15 @@ fn show(borrow t: Token) -> int32 {   // borrow: read-only view, ownership stays
 fn consume(move t: Token) -> void {   // move: ownership enters the function
     drop t;                           // explicit destruction
 }
+
+fn main() -> void {
+    let a = Token { id: 1 };
+    builtin.print(builtin.str(show(a)));   // borrow: a stays alive
+    consume(move a);                       // move: ownership leaves
+    let b = Token { id: 2 };
+    drop b;                                // drop: explicit destruction
+    let c = Token { id: 3 };               // no explicit drop: destroyed at scope end
+}
 ```
 
 Using a moved value is a compile error. A binding freed on only some
@@ -146,27 +187,6 @@ branches becomes **maybe-unique**: the compiler destroys it on every
 branch that did not free it, so it is uniformly dead after the join —
 no runtime bookkeeping. The payoff: no GC pauses, no background
 collector, release timing predictable at compile time.
-
-### Deterministic destruction
-
-A struct may declare at most one destruction hook:
-
-```stilla
-struct File {
-    fd: int32;
-    path: str;
-
-    drop(file) {
-        os.close(file.fd);
-    }
-}
-```
-
-On normal control flow, destruction order is fully deterministic: the
-user `drop` hook first, then unique fields in reverse declaration order,
-then the value is marked destroyed. Locals are destroyed in reverse
-creation order at scope end. Structs are *not* classes: no constructors,
-no visibility control.
 
 ### No closures — two compensations
 
@@ -178,34 +198,42 @@ generators. Two compensations:
 1. **Function-value fields** — structs can store function values, with
    explicit receivers (no `receiver.method()` sugar).
 2. **Context threading** — the `iter` module's `*_with` combinators accept
-   a borrowed context passed to the operation on every call:
+   a borrowed context passed to the operation on every call — here a
+   struct value, the very thing a closure would have captured:
 
 ```stilla
-let sum = iter.fold[int32, int32](lists.range(1, 10), 0,
-    fn(move acc: int32, borrow x: int32) -> int32 { acc + x });
+struct Scale {
+    factor: int32;
+}
+
+let scale = Scale { factor: 3 };
+
+let sum = iter.fold_with[int32, int32, Scale](lists.range(1, 10), 0, scale,
+    fn(move acc: int32, borrow ctx: Scale, borrow x: int32) -> int32 {
+        acc + x * ctx.factor
+    });
 ```
+
+`fold_with` threads the borrowed `Scale` value into the step on every
+call; the lambda never touches anything outside its own parameters.
 
 ### One evaluation rule, defined failures
 
-The whole language has a single evaluation-order rule: subexpressions
-evaluate exactly once, left-to-right in source order — calls, member and
-subscript access, binary operands, literals, `match` scrutinees alike.
-`and` / `or` short-circuit. Runtime failures split into two classes:
+The whole language has one evaluation-order rule: subexpressions evaluate
+exactly once, left-to-right in source order; `and` / `or` short-circuit.
+Runtime failures come in two classes:
 
 - **Defined numeric behavior, not traps.** Integer arithmetic wraps
-  modulo 2³² / 2⁶⁴ — overflow never traps. Integer `div` / `rem` by zero
-  traps (`int32_min div -1` wraps; `i64_min div -1` traps). Float division
-  and remainder by zero follow IEEE 754 (`±inf`, NaN) and never trap.
-  Shifts mask their count modulo 32 / 64. Numeric `as` conversions never
-  trap: float→int truncates and saturates (NaN becomes 0).
-- **Deterministic traps.** Invalid `any` recovery, an invalid list
-  element read (a consuming destructure of a short list), out-of-range
-  `array.get` / `array.set`, and malformed `string` operations (bad
-  offsets, invalid UTF-8) trap — never undefined behavior — terminating
-  exactly like `builtin.panic`.
-
-Floats follow IEEE 754 (`float32` = binary32, `f64` = binary64); NaN
-payloads round-trip losslessly.
+  modulo 2³² / 2⁶⁴ — overflow never traps; `div` / `rem` by zero traps
+  (`int32_min div -1` wraps, `int64_min div -1` traps). Floats follow
+  IEEE 754 — division by zero yields `±inf` / NaN, never traps, and NaN
+  payloads round-trip losslessly (`float32` and `float64`). Shifts mask their count mod 32 / 64. Numeric `as`
+  conversions never trap: float→int truncates and saturates (NaN
+  becomes 0).
+- **Deterministic traps.** Invalid `any` recovery, a consuming
+  destructure of a short list, out-of-range `array.get` / `array.set`,
+  and malformed `string` operations (bad offsets, invalid UTF-8) trap —
+  never undefined behavior — terminating exactly like `builtin.panic`.
 
 ### Panic: terminate, don't unwind
 
